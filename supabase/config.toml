@@ -2,3 +2,6 @@ project_id = "dyxdhfommhxsglggqdkt"
 
 [functions.mercado-pago-webhook]
 verify_jwt = false
+
+[functions.marketplace-oauth-callback]
+verify_jwt = false

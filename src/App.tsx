@@ -43,6 +43,9 @@ function App() {
   const [authPassword, setAuthPassword] = useState('')
   const [authBusy, setAuthBusy] = useState(false)
   const [authMessage, setAuthMessage] = useState<string | null>(null)
+  const [marketplaceLoading, setMarketplaceLoading] = useState(false)
+  const [marketplaceUrl, setMarketplaceUrl] = useState<string | null>(null)
+  const [marketplaceError, setMarketplaceError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!isSupabaseConfigured) {
@@ -160,6 +163,28 @@ function App() {
     setAuthMessage(error?.message ?? null)
   }
 
+  const connectMarketplace = async () => {
+    if (!session || marketplaceLoading) {
+      return
+    }
+
+    setMarketplaceLoading(true)
+    setMarketplaceUrl(null)
+    setMarketplaceError(null)
+
+    const { data, error } = await supabase.functions.invoke('marketplace-auth-url', {
+      body: {},
+    })
+
+    setMarketplaceLoading(false)
+    if (error || typeof data?.authorization_url !== 'string') {
+      setMarketplaceError(error?.message ?? 'No se pudo generar la URL de autorización.')
+      return
+    }
+
+    setMarketplaceUrl(data.authorization_url)
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -175,6 +200,18 @@ function App() {
           <div className="auth-session">
             <span>Sesión: {session.user.email}</span>
             <button type="button" onClick={signOut} disabled={authBusy}>Cerrar sesión</button>
+            <button type="button" onClick={connectMarketplace} disabled={marketplaceLoading}>
+              {marketplaceLoading ? 'Generando URL…' : 'Conectar Mercado Pago'}
+            </button>
+            {marketplaceUrl ? (
+              <div className="auth-marketplace-status">
+                <p role="status">URL OAuth generada correctamente</p>
+                <button type="button" onClick={() => window.location.assign(marketplaceUrl)}>
+                  Abrir Mercado Pago
+                </button>
+              </div>
+            ) : null}
+            {marketplaceError ? <p className="error-state" role="alert">{marketplaceError}</p> : null}
           </div>
         ) : (
           <form className="auth-form" onSubmit={(event) => event.preventDefault()}>
