@@ -43,7 +43,12 @@ const getBearerToken = (request: Request): string | null => {
 const getCorsHeaders = (request: Request): Record<string, string> => {
   const appBaseUrl = getEnv('APP_BASE_URL')
   const requestOrigin = request.headers.get('origin') ?? ''
-  const allowedOrigins = new Set(['http://localhost:5173', 'http://127.0.0.1:5173'])
+  const allowedOrigins = new Set([
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://localhost:5174',
+    'http://127.0.0.1:5174',
+  ])
 
   if (appBaseUrl) {
     try {
