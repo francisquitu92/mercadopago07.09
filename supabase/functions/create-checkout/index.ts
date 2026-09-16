@@ -10,6 +10,7 @@ type ProductRow = {
   price: number | string
   currency: string
   is_active: boolean
+  creator_user_id: string
 }
 
 type PreferenceItem = {
@@ -69,6 +70,17 @@ const getBearerToken = (request: Request): string | null => {
   return match?.[1] ?? null
 }
 
+const calculateMarketplaceFee = (total: number): number | null => {
+  const configuredRate = getEnv('MARKETPLACE_FEE_RATE')
+  const rate = configuredRate === undefined ? 0.1 : Number(configuredRate)
+  if (!Number.isFinite(rate) || rate <= 0 || rate >= 1) {
+    return null
+  }
+
+  const fee = Math.round(total * rate * 100) / 100
+  return Number.isFinite(fee) && fee > 0 && fee < total ? fee : null
+}
+
 Deno.serve(async (request) => {
   if (request.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
@@ -80,15 +92,13 @@ Deno.serve(async (request) => {
 
   const supabaseUrl = getEnv('SUPABASE_URL')
   const serviceRoleKey = getEnv('SUPABASE_SERVICE_ROLE_KEY')
-  const accessToken = getEnv('MP_ACCESS_TOKEN')
   const appBaseUrl = getEnv('APP_BASE_URL')
 
   console.log(`SUPABASE_URL_PRESENT=${Boolean(supabaseUrl)}`)
   console.log(`SUPABASE_SERVICE_ROLE_KEY_PRESENT=${Boolean(serviceRoleKey)}`)
-  console.log(`MP_ACCESS_TOKEN_PRESENT=${Boolean(accessToken)}`)
   console.log(`APP_BASE_URL_PRESENT=${Boolean(appBaseUrl)}`)
 
-  if (!supabaseUrl || !serviceRoleKey || !accessToken || !appBaseUrl) {
+  if (!supabaseUrl || !serviceRoleKey || !appBaseUrl) {
     return jsonResponse({ ok: false, error: 'Checkout service is not configured' }, 500)
   }
 
@@ -110,7 +120,7 @@ Deno.serve(async (request) => {
   const productIds = parsedItems.items.map((item) => item.productId)
   const { data: products, error: productsError } = await supabase
     .from('products')
-    .select('id,name,description,price,currency,is_active')
+    .select('id,name,description,price,currency,is_active,creator_user_id')
     .in('id', productIds)
 
   if (productsError) {
@@ -120,6 +130,7 @@ Deno.serve(async (request) => {
 
   const productMap = new Map((products as ProductRow[] | null ?? []).map((product) => [product.id, product]))
   const preferenceItems: PreferenceItem[] = []
+  const sellerIds = new Set<string>()
   let subtotal = 0
   let currency: string | null = null
 
@@ -131,6 +142,10 @@ Deno.serve(async (request) => {
     if (!product.is_active) {
       return jsonResponse({ ok: false, error: 'Product is inactive' }, 409)
     }
+    if (!product.creator_user_id) {
+      return jsonResponse({ ok: false, error: 'Product seller is not configured' }, 409)
+    }
+    sellerIds.add(product.creator_user_id)
 
     const unitPrice = Number(product.price)
     if (!Number.isFinite(unitPrice) || unitPrice < 0 || !product.currency) {
@@ -155,6 +170,16 @@ Deno.serve(async (request) => {
 
   if (!currency || !Number.isFinite(subtotal) || subtotal <= 0) {
     return jsonResponse({ ok: false, error: 'Cart total is invalid' }, 400)
+  }
+
+  if (sellerIds.size !== 1) {
+    return jsonResponse({ ok: false, error: 'Cart contains products from different sellers' }, 409)
+  }
+
+  const marketplaceFee = calculateMarketplaceFee(subtotal)
+  if (marketplaceFee === null) {
+    console.log('stage=marketplace_fee_validation_failed')
+    return jsonResponse({ ok: false, error: 'Marketplace fee is invalid' }, 500)
   }
 
   const token = getBearerToken(request)
@@ -183,6 +208,32 @@ Deno.serve(async (request) => {
     return jsonResponse({ ok: false, error: 'Account profile is not ready' }, 409)
   }
 
+  const sellerUserId = Array.from(sellerIds)[0]
+  const { data: sellerAccount, error: sellerAccountError } = await supabase
+    .from('mercado_pago_accounts')
+    .select('user_id,status,access_token,expires_at')
+    .eq('user_id', sellerUserId)
+    .maybeSingle()
+
+  if (sellerAccountError) {
+    console.log('stage=seller_account_lookup_error')
+    return jsonResponse({ ok: false, error: 'Unable to validate seller Mercado Pago account' }, 500)
+  }
+
+  if (!sellerAccount) {
+    return jsonResponse({ ok: false, error: 'Seller does not have Mercado Pago connected' }, 409)
+  }
+
+  if (sellerAccount.status !== 'connected') {
+    return jsonResponse({ ok: false, error: 'Seller requires Mercado Pago reauthorization' }, 409)
+  }
+
+  const sellerToken = typeof sellerAccount.access_token === 'string' ? sellerAccount.access_token.trim() : ''
+  const sellerExpiresAt = new Date(sellerAccount.expires_at).getTime()
+  if (!sellerToken || !Number.isFinite(sellerExpiresAt) || sellerExpiresAt <= Date.now()) {
+    return jsonResponse({ ok: false, error: 'Seller requires Mercado Pago reauthorization' }, 409)
+  }
+
   const idempotencyKey = request.headers.get('x-idempotency-key')?.trim() || crypto.randomUUID()
   const externalReference = `order_${userId}_${idempotencyKey}`
   const baseUrl = appBaseUrl.replace(/\/$/, '')
@@ -198,17 +249,54 @@ Deno.serve(async (request) => {
     return jsonResponse({ ok: false, error: 'Unable to check checkout idempotency' }, 500)
   }
 
+  if (existingOrder) {
+    const { data: existingOrderItems, error: existingOrderItemsError } = await supabase
+      .from('order_items')
+      .select('product_id,quantity,unit_price,subtotal')
+      .eq('order_id', existingOrder.id)
+
+    if (existingOrderItemsError || !existingOrderItems || existingOrderItems.length === 0) {
+      return jsonResponse({ ok: false, error: 'Unable to validate checkout idempotency' }, 409)
+    }
+
+    const existingProductIds = existingOrderItems.map((item) => item.product_id)
+    const { data: existingProducts, error: existingProductsError } = await supabase
+      .from('products')
+      .select('id,creator_user_id')
+      .in('id', existingProductIds)
+
+    if (existingProductsError || !existingProducts || existingProducts.length !== existingProductIds.length) {
+      return jsonResponse({ ok: false, error: 'Unable to validate checkout seller' }, 409)
+    }
+
+    const existingSellerIds = new Set(existingProducts.map((product) => product.creator_user_id))
+    if (existingSellerIds.size !== 1 || !existingSellerIds.has(sellerUserId)) {
+      return jsonResponse({ ok: false, error: 'Checkout idempotency key belongs to another seller' }, 409)
+    }
+
+    const requestedItems = new Map(preferenceItems.map((item) => [item.id, item]))
+    const sameCart = existingOrderItems.length === preferenceItems.length && existingOrderItems.every((item) => {
+      const requested = requestedItems.get(item.product_id)
+      return requested !== undefined
+        && item.quantity === requested.quantity
+        && Number(item.unit_price) === requested.unit_price
+        && Number(item.subtotal) === requested.unit_price * requested.quantity
+    })
+
+    if (!sameCart) {
+      return jsonResponse({ ok: false, error: 'Checkout idempotency key belongs to another cart' }, 409)
+    }
+  }
+
   if (existingOrder?.preference_id && existingOrder.status === 'pending_payment') {
     const existingPreferenceResponse = await fetch(`https://api.mercadopago.com/checkout/preferences/${encodeURIComponent(existingOrder.preference_id)}`, {
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers: { Authorization: `Bearer ${sellerToken}` },
     })
     if (existingPreferenceResponse.ok) {
       const existingPreference = await existingPreferenceResponse.json() as Record<string, unknown>
-      const existingCheckoutUrl = typeof existingPreference.sandbox_init_point === 'string'
-        ? existingPreference.sandbox_init_point
-        : typeof existingPreference.init_point === 'string'
-          ? existingPreference.init_point
-          : null
+      const existingCheckoutUrl = typeof existingPreference.init_point === 'string'
+        ? existingPreference.init_point
+        : null
       if (existingCheckoutUrl) {
         return jsonResponse({
           success: true,
@@ -264,10 +352,11 @@ Deno.serve(async (request) => {
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${accessToken}`,
+      Authorization: `Bearer ${sellerToken}`,
     },
     body: JSON.stringify({
       items: preferenceItems,
+      marketplace_fee: marketplaceFee,
       external_reference: externalReference,
       back_urls: {
         success: `${baseUrl}/checkout/success`,
@@ -287,11 +376,9 @@ Deno.serve(async (request) => {
 
   const preference = await preferenceResponse.json() as Record<string, unknown>
   const preferenceId = typeof preference.id === 'string' ? preference.id : null
-  const checkoutUrl = typeof preference.sandbox_init_point === 'string'
-    ? preference.sandbox_init_point
-    : typeof preference.init_point === 'string'
-      ? preference.init_point
-      : null
+  const checkoutUrl = typeof preference.init_point === 'string'
+    ? preference.init_point
+    : null
 
   if (!preferenceId || !checkoutUrl) {
     await supabase.from('orders').update({ status: 'cancelled', updated_at: new Date().toISOString() }).eq('id', order.id)
